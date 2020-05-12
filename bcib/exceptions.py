@@ -1,0 +1,2 @@
+class ExecutionStopRequest(RuntimeError):
+    pass
