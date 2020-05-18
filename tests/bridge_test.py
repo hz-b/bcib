@@ -7,6 +7,7 @@ import functools
 
 logger = logging.getLogger('bcib')
 
+
 class TestExecutor(unittest.TestCase):
     def setUp(self):
         self.bridge = setup_threaded_callback_iterator_bridge()
@@ -118,7 +119,6 @@ class TestExecutor(unittest.TestCase):
         self.assertEqual(r, 'Result 2')
         logger.info('done')
 
-
     def test03_execute_two_times(self):
         '''Sending one command after the other
         '''
@@ -138,7 +138,6 @@ class TestExecutor(unittest.TestCase):
         r = self._run_as_iterator([p1])
         self.assertEqual(r, 'Result 1')
         logger.info('done')
-
 
     def test04_execute_many_times_many_commands(self):
         '''Sending one command after the other
@@ -174,7 +173,6 @@ class TestExecutor(unittest.TestCase):
         r = self._run_as_iterator([p1, p2, p3])
         self.assertEqual(r, 'Result 3')
         logger.info('done')
-
 
 
 if __name__ == '__main__':

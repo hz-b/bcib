@@ -4,20 +4,21 @@ Many solvers typically expect to call functions and receive
 values. Bluesky's run engine e.g. expects to consume messages
 provided by an iterator.
 
-
-
 Warning:
-    please use currently *only* instance of
+    please use currently *only* instances of
     :class:`CallbackIteratorBridge`.
 
 Currently only instances of :class:`CallbackIteratorBridge` should
-be used. It has only be tested in a threading environement, as the
-queues and the state_machines are shared the brige and delegator.
+be used. It has only be tested in a threading environment, as the
+queues and the state_machines are shared the bridge and delegator.
 
 Separate instances of :class:`_BridgeToDelegator` and
-:class:`_DelegateToIterator` could be used. This would required
-:however: that the state_machines would be shared too.
+:class:`_DelegateToIterator` could be used. This would require,
+however that the state_machines would be shared too.
 '''
+
+from .exceptions import ExecutionStopRequest
+from super_state_machine.machines import StateMachine
 
 import itertools
 import queue
@@ -25,16 +26,14 @@ import traceback
 import sys
 import logging
 import enum
-import super_state_machine.machines
 
 logger = logging.getLogger('bcib')
 
 
-class ExecutionStopRequest(RuntimeError):
-    pass
+class CommandProcessingState(StateMachine):
+    '''treat commands in a single file fashion
+    '''
 
-
-class CommandProcessingState(super_state_machine.machines.StateMachine):
     class States(enum.Enum):
         UNDEFINED = 'undefined'
         # Submitted command
@@ -48,16 +47,19 @@ class CommandProcessingState(super_state_machine.machines.StateMachine):
 
     class Meta:
         initial_state = 'undefined'
-        transitions =  {
-            'undefined'  : ['submitting', 'failed'],
-            'submitting' : ['submitted', 'failed'],
-            'submitted'  : ['waiting', 'finished', 'failed'],
-            'waiting'    : ['finished', 'failed'],
-            'finished'   : ['submitting', 'failed'],
-            #'failed'     : ['submitting'],
+        transitions = {
+            'undefined':  ['submitting', 'failed'],
+            'submitting': ['submitted', 'failed'],
+            'submitted':  ['waiting', 'finished', 'failed'],
+            'waiting':    ['finished', 'failed'],
+            'finished':   ['submitting', 'failed'],
+            # 'failed' : ['submitting'],
         }
 
-class ExecutorState(super_state_machine.machines.StateMachine):
+
+class BridgeState(StateMachine):
+    '''Is the bridge useable?
+    '''
     class States(enum.Enum):
         UNDEFINED = 'undefined'
         RUNNING = 'running'
@@ -69,32 +71,36 @@ class ExecutorState(super_state_machine.machines.StateMachine):
 
     class Meta:
         initial_state = 'undefined'
-        transitions =  {
-            'undefined'  : ['running', 'stopping', 'failed'],
-            'running' : ['stopping', 'failed'],
-            'stopping' : ['stopped', 'failed'],
-            'stopped' : ['running', 'failed']
+        transitions = {
+            'undefined': ['running', 'stopping', 'failed'],
+            'running':   ['stopping', 'failed'],
+            'stopping':  ['stopped', 'failed'],
+            'stopped':   ['running', 'failed']
         }
 
 
 class EndOfEvaluation:
     '''Evaluation ended
+
+    Used to inform the iterator that no further objects will be
+    received.
     '''
 
 end_of_evaluation = EndOfEvaluation()
+
 
 class _BaseClass_Bridge_Delegator:
     '''Base class
 
     Both classes :class:`_BridgeToDelegator` and
-    :class:`_DelegateToIterator`need the member defined below.
+    :class:`_DelegateToIterator` need the members defined below.
     These classes do not inherit directly from this class, as
     :class:`CallbackIteratorBridge` inherits from both these classes.
     '''
     def __init__(self, *, command_queue, result_queue, log=None,
-                maxtime_for_next_command=5, command_execution_timeout=5):
+                 maxtime_for_next_command=5, command_execution_timeout=5):
 
-        self.state = ExecutorState()
+        self.state = BridgeState()
         self.cmd_state = CommandProcessingState()
 
         self.command_queue = command_queue
@@ -104,7 +110,8 @@ class _BaseClass_Bridge_Delegator:
             log = logger
         self.log = log
 
-        # Shall these timeouts be kept in a book keeping device
+        # Shall these timeouts be kept in a book keeping device ?
+        # That would make this module dependend on ophyd
         self.maxtime_for_next_command = maxtime_for_next_command
         self.command_execution_timeout = command_execution_timeout
 
@@ -122,8 +129,13 @@ class _BaseClass_Bridge_Delegator:
         )
         return txt
 
-    #-------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     def clearQueues(self):
+        '''make sure that queues are empty
+
+        10 times: you know German "Angst". Then guess what an
+        "Angsteisen" is.
+        '''
         for i in range(10):
             if self.command_queue.qsize() > 0:
                 try:
@@ -137,28 +149,33 @@ class _BaseClass_Bridge_Delegator:
                     pass
 
 
-
 class _BridgeToDelegator:
     '''Delegate values received by callbacks to the iterator
 
-    Warning:
-        This 
     '''
 
     def stopDelegation(self, fail_mode=False):
+        '''Inform delegator that we are done
+        '''
         cls_name = self.__class__.__name__
         if self.state.is_stopped:
             txt = 'command delegation stopped. Not stopping again'
             self.log.info(f'{cls_name}: {txt}')
             return
-        
+
         if self.state.is_stopping:
-            txt = 'command delegation already asked to stop. Not trying to stop it again'
+            txt = (
+                'command delegation already asked to stop. Not trying to'
+                ' stop it again'
+                )
             self.log.info(f'{cls_name}: {txt}')
             return
-        
+
         if self.cmd_state.is_waiting:
-            txt = f'{cls_name}: still waiting for  response to delegated command {self.last_command}'
+            txt = (
+                f'{cls_name}: still waiting for  response to delegated'
+                f' command {self.last_command}'
+            )
             self.log.info(txt)
 
         if not self.state.is_failed:
@@ -175,8 +192,11 @@ class _BridgeToDelegator:
         self.log.info(f'{cls_name}: command execution stopped')
 
     def submit(self, cmd, wait_for_result=True):
-
-        #if self.state.is_stopped:
+        '''
+        Warning:
+           wait_for_result=False is not tested
+        '''
+        # if self.state.is_stopped:
         #    self.clearQueues()
         #    self.state.set_running()
 
@@ -187,8 +207,8 @@ class _BridgeToDelegator:
         self.cmd_state.set_submitted()
         if not wait_for_result:
             self.cmd_state.set_finished()
-            return 
-        
+            return
+
         self.cmd_state.set_waiting()
         try:
             r = self.result_queue.get(timeout=self.command_execution_timeout)
@@ -206,6 +226,8 @@ class _BridgeToDelegator:
 
 
 class _DelegateToIterator(_BaseClass_Bridge_Delegator):
+    '''Receives objects from queue and passes it to the iterator
+    '''
     def __iter__(self):
         '''Return appropriate bluesky plans
 
@@ -221,16 +243,25 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
             return r
 
     def execute(self, as_iter=False):
+        '''execute one command after the other.
 
+        Receives one object after the other from :any:`command_queue`.
+        Hands it over to :meth:`_executeSingle`
+
+        Typically called from :meth:`__iter__`.
+
+        Warning:
+            as_iter = False was never tested!
+        '''
         if self.state.is_stopped:
             txt = 'Executor in stopped state. Setting it back to running'
             self.log.info(txt)
             self.state.set_running()
-            #raise AssertionError(txt)
+            # raise AssertionError(txt)
 
         if self.state.is_stopping:
             logger.waring('Executor is stopping. Still asked to restart')
-        
+
         cls_name = self.__class__.__name__
         self.log.info(f'{cls_name}: waiting for commands to execute')
 
@@ -247,7 +278,7 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
             try:
                 if as_iter:
                     # Consider yielding command per command
-                    r = (yield from self._executeSingle(cmd, as_iter=as_iter) )
+                    r = (yield from self._executeSingle(cmd, as_iter=as_iter))
                 else:
                     r = self._executeSingle(cmd, as_iter=as_iter)
             except Exception as exc:
@@ -267,9 +298,9 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
 
     def _executeSingle(self, cmd, as_iter=False):
         '''
-        Todo
+        Todo:
             Consider if a 'static' or instance message is yielded
-            as soons execution stops.
+            as soon as execution stops.
 
             Why:
                 e.g. bluesky deferred pause request. Inform bluesky
@@ -277,14 +308,14 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
         '''
 
         if not as_iter:
-           raise NotImplementedError('Direct call is not tested yet')
+            raise NotImplementedError('Direct call is not tested yet')
 
         cls_name = self.__class__.__name__
         self.log.info(f'{cls_name}: waiting for commands to execute')
 
         fmt = (
-                '{}: status is {} but commands are still requested to be executed.'
-                'Stopping before executing cmd {}'
+            '{}: status is {} but commands are still requested to be executed.'
+            'Stopping before executing cmd {}'
         )
 
         def run_iter(a_iter):
@@ -318,17 +349,18 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
                 yield c
 
         if as_iter:
-            r = (yield from cmd() )
+            r = (yield from cmd())
             # r = (yield from run_iter(cmd()) )
         else:
             raise NotImplementedError('Not tested yet')
             r = cmd()
         return r
 
+
 class CallbackIteratorBridge(_BridgeToDelegator, _DelegateToIterator,
                              _BaseClass_Bridge_Delegator):
     '''Delegate submitted plans to the iterator consumer
-    
+
     Follows delegator pattern.
 
     Args:
@@ -337,21 +369,25 @@ class CallbackIteratorBridge(_BridgeToDelegator, _DelegateToIterator,
         command_queue : a queue of length 1
         result_queue  : a queue of length 1
 
-    User is expected to submit command using method :submit:. 
+    User is expected to submit command using :meth:`submit`.
     These command will then appear to the iterator consumer.
-    This executor can be used by functions that expect a collback.
+    This executor can be used by functions that expect a callback.
     The callback is then responsible to submit its commands using
-    :meth: submit. These callbacks are then handed out from the 
-    __iter__ method. 
+    :meth:`submit`. These callbacks are then handed out from the
+    __iter__ method.
 
     This approach allows:
-        * passing a plan to the run engine 
+        * passing a plan to the run engine
         * execute the call back in a separate coroutine thread
           or callback
 
     Warning:
-        The callback and the run engine must not be executed in
-        different runnable entities (e.g. different threads)
-        The queues must match these settings.
+        The callback and the run engine must be executed in
+        different runnable entities (e.g. different threads).
+        The queues must match the properties as described in
+        the arguments.
 
+    If you are using it in a threaded environment function
+    :func:`bcib.threaded_bridge.setup_threaded_callback_iterator_bridge`
+    can be used to setup such a bridge.
     '''

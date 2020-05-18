@@ -13,9 +13,9 @@ and returned to the callback.
 A state engine is used to supervise the state that:
     1. an object is received
     2. the object is executed and the yielded  messages handed to
-      the consuming object
-    3. the return value of the exeucted object is returned back
-       to the calllback
+       the consuming object
+    3. the return value of the executed object is returned back
+       to the callback
     4. a new command is only accepted after the steps above have
        been completed
 
@@ -24,26 +24,34 @@ Please note:
     concurrently executed entities (e.g. threads).
 
 Common use case would be:
+
 ::
+
     from bcib.threaded_bridge import setup_threaded_callback_iterator_bridge
 
     bridge = setup_threaded_callback_iterator_bridge()
 
     def iterate():
         for elem in self.bridge:
+            # Use the element
+            # Author's use case: a message that's yielded to
+            # bluesky's run engine
             pass
 
     thread = threading.Thread(target=iterate)
-    self.thread.start()
+    thread.start()
     try:
+        # The partials would be a list of user commands.
+        # Typically the method
         for p in partials:
-            r = self.bridge.submit(p)
+            r = bridge.submit(p)
     finally:
-        self.bridge.stopDelegation()
-        self.thread.join()
+        bridge.stopDelegation()
+        .thread.join()
 
-    please use *only* instances of
-    :class:`CallbackIteratorBridge` directly
+
+please use *only* instances of
+:class:`bcib.CallbackIteratorBridge` directly
 '''
 from .bridge import CallbackIteratorBridge
 from .exceptions import ExecutionStopRequest
