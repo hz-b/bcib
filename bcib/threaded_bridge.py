@@ -2,7 +2,7 @@ from .bridge import CallbackIteratorBridge
 from queue import Queue
 
 
-def setup_threaded_callback_iterator_bridge():
+def setup_bridge():
     '''Convenience function for setting up the callback bridge
     '''
     q_cmd = Queue(maxsize=1)
