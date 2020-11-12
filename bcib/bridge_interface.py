@@ -15,7 +15,7 @@ Interfaces:
 from abc import ABCMeta, abstractmethod
 
 
-class CallbackIteratorBridgeInterface(ABCMeta):
+class CallbackIteratorBridgeInterface(metaclass=ABCMeta):
     '''Delegate submitted plans to the iterator consumer
 
     Args:
