@@ -1,6 +1,6 @@
 import logging
 # logging.basicConfig(level='DEBUG')
-from bcib.threaded_bridge import setup_threaded_callback_iterator_bridge
+from bcib.threaded_bridge import setup_bridge
 import threading
 import unittest
 import functools
@@ -10,7 +10,7 @@ logger = logging.getLogger('bcib')
 
 class TestExecutor(unittest.TestCase):
     def setUp(self):
-        self.bridge = setup_threaded_callback_iterator_bridge()
+        self.bridge = setup_bridge()
 
     def _run_in_execute(self, partial):
         raise NotImplementedError
