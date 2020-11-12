@@ -4,17 +4,24 @@ Many solvers typically expect to call functions and receive
 values. Bluesky's run engine e.g. expects to consume messages
 provided by an iterator.
 
+The implementation of the bridge is split up in 4 parts.
+    1. the base class. Defines a common __init__ and setup of state
+    2. a mixin class defining the submit method
+    3. a mixin class defining the __iter__ method
+    4. a class inherting from 2 and 3 that makes then the full bridge
+
+Motivation: the submit and __iter__ could be used in different
+processe or decoupled object.
+
 Warning:
-    please use currently *only* instances of
-    :class:`CallbackIteratorBridge`.
+    Currently only instances of :class:`CallbackIteratorBridge`
+    should be used. It has only be tested in a threading
+    environment, as the queues and the state_machines are shared
+    by the bridge and delegator.
 
-Currently only instances of :class:`CallbackIteratorBridge` should
-be used. It has only be tested in a threading environment, as the
-queues and the state_machines are shared the bridge and delegator.
-
-Separate instances of :class:`_BridgeToDelegator` and
-:class:`_DelegateToIterator` could be used. This would require,
-however that the state_machines would be shared too.
+Todo:
+    * consider to drop the extra complexity
+    * consider how to handle RunEngine.stop and thus RunEngine.resume
 '''
 
 from .exceptions import ExecutionStopRequest
@@ -26,12 +33,18 @@ import traceback
 import sys
 import logging
 import enum
+from .bridge_interface import CallbackIteratorBridgeInterface
 
 logger = logging.getLogger('bcib')
 
 
 class CommandProcessingState(StateMachine):
     '''treat commands in a single file fashion
+
+    This state machine is used to trace that the only
+    "one one passenger is using the bridge at a time"
+
+    It could be seen as debugging functionality.
     '''
 
     class States(enum.Enum):
@@ -53,7 +66,7 @@ class CommandProcessingState(StateMachine):
             'submitted':  ['waiting', 'finished', 'failed'],
             'waiting':    ['finished', 'failed'],
             'finished':   ['submitting', 'failed'],
-            # 'failed' : ['submitting'],
+            'failed':     ['undefined'],
         }
 
 
@@ -86,19 +99,28 @@ class EndOfEvaluation:
     received.
     '''
 
+
 end_of_evaluation = EndOfEvaluation()
 
-
-class _BaseClass_Bridge_Delegator:
+# CallbackIteratorBridgeInterface
+class _BaseClass_Bridge:
     '''Base class
 
     Both classes :class:`_BridgeToDelegator` and
     :class:`_DelegateToIterator` need the members defined below.
     These classes do not inherit directly from this class, as
     :class:`CallbackIteratorBridge` inherits from both these classes.
+
+    Todo:
+        * At start up it can take a bit of time until the command
+          queue can be used the first time. Any subsequent use
+          should be rather fast. Shoud one send a startup object
+          on start?
     '''
-    def __init__(self, *, command_queue, result_queue, log=None,
-                 maxtime_for_next_command=5, command_execution_timeout=5):
+    def __init__(self, *, command_queue, result_queue,
+                 next_cmd_timeout=5, cmd_exec_timeout=5,
+                 cmd_queue_timeout=1,
+                 log=None):
 
         self.state = BridgeState()
         self.cmd_state = CommandProcessingState()
@@ -112,9 +134,9 @@ class _BaseClass_Bridge_Delegator:
 
         # Shall these timeouts be kept in a book keeping device ?
         # That would make this module dependend on ophyd
-        self.maxtime_for_next_command = maxtime_for_next_command
-        self.command_execution_timeout = command_execution_timeout
-
+        self.next_cmd_timeout = next_cmd_timeout
+        self.cmd_exec_timeout = cmd_exec_timeout
+        self.cmd_queue_timeout = cmd_queue_timeout
         self.last_command = None
 
     def __repr__(self):
@@ -123,8 +145,9 @@ class _BaseClass_Bridge_Delegator:
             f'{cls_name}('
             f' command_queue={self.command_queue},'
             f' result_queue={self.result_queue},'
-            f' command_queue_timeout={self.maxtime_for_next_command},'
-            f' command_execution_timeout={self.command_execution_timeout},'
+            f' next_cmd_timeout={self.next_cmd_timeout},'
+            f' cmd_exec_timeout={self.cmd_exec_timeout},'
+            f' cmd_queue_timeout={self.cmd_queue_timeout},'
             ' )'
         )
         return txt
@@ -148,10 +171,15 @@ class _BaseClass_Bridge_Delegator:
                 except queue.Empty:
                     pass
 
+    def reset(self):
+        if self.state.is_failed:
+            self.log.info('Setting from failed to undefined')
+            self.state.set_undefined()
+            self.clearQueues()
 
-class _BridgeToDelegator:
-    '''Delegate values received by callbacks to the iterator
 
+class _CallbackToBrigeMixin:
+    '''Delegates values received by the callback to the command queue
     '''
 
     def stopDelegation(self, fail_mode=False):
@@ -186,24 +214,19 @@ class _BridgeToDelegator:
         if fail_mode:
             # Be sure to empty queues
             self.clearQueues()
-        # Inform bluesky that we are done ...
+
+        # Inform the iterator that we are done
         self.submit(end_of_evaluation, wait_for_result=False)
         self.state.set_stopped()
         self.log.info(f'{cls_name}: command execution stopped')
 
     def submit(self, cmd, wait_for_result=True):
         '''
-        Warning:
-           wait_for_result=False is not tested
         '''
-        # if self.state.is_stopped:
-        #    self.clearQueues()
-        #    self.state.set_running()
 
-        command_queue_put_timeout = 10
         self.cmd_state.set_submitting()
         self.last_command = cmd
-        self.command_queue.put(cmd, timeout=command_queue_put_timeout)
+        self.command_queue.put(cmd, timeout=self.cmd_queue_timeout)
         self.cmd_state.set_submitted()
         if not wait_for_result:
             self.cmd_state.set_finished()
@@ -211,7 +234,7 @@ class _BridgeToDelegator:
 
         self.cmd_state.set_waiting()
         try:
-            r = self.result_queue.get(timeout=self.command_execution_timeout)
+            r = self.result_queue.get(timeout=self.cmd_exec_timeout)
         except queue.Empty:
             self.log.error(f'Did not receive response for command {cmd}')
             self.cmd_state.set_failed()
@@ -225,33 +248,34 @@ class _BridgeToDelegator:
         return r
 
 
-class _DelegateToIterator(_BaseClass_Bridge_Delegator):
+class _BridgeToIteratorMixin:
     '''Receives objects from queue and passes it to the iterator
     '''
     def __iter__(self):
-        '''Return appropriate bluesky plans
+        '''yield the objects
 
-        Heavy lifting done by :meth:`_iterInner`
+        Heavy lifting done by :meth:`exectue`
         '''
         # self.checkOnStart()
 
         r = None
         try:
-            r = (yield from self.execute(as_iter=True))
+            r = (yield from self.execute())
         finally:
-            self.log.info(f'Iterator finished. Returning value {r}')
+            self.log.info('Iterator finished. Returning value %s', (r,))
             return r
 
-    def execute(self, as_iter=False):
+    def execute(self):
         '''execute one command after the other.
 
         Receives one object after the other from :any:`command_queue`.
         Hands it over to :meth:`_executeSingle`
 
-        Typically called from :meth:`__iter__`.
-
-        Warning:
-            as_iter = False was never tested!
+        Todo:
+           * should be the state set automatically back to running?
+           * better: context manager and let that one set it back
+             to running? Why: if it stopped in the middle most probably
+             an exception has happend.
         '''
         if self.state.is_stopped:
             txt = 'Executor in stopped state. Setting it back to running'
@@ -263,24 +287,26 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
             logger.waring('Executor is stopping. Still asked to restart')
 
         cls_name = self.__class__.__name__
-        self.log.info(f'{cls_name}: waiting for commands to execute')
+        self.log.info('%s waiting for commands to execute', (cls_name,))
 
         for cnt in itertools.count():
-            cmd = self.command_queue.get(self.maxtime_for_next_command)
+            cmd = self.command_queue.get(self.next_cmd_timeout)
 
             if cmd is end_of_evaluation:
                 # That's all folks
-                self.log.info(f'{cls_name}: evaluation finished')
+                self.log.info('%s: evaluation finished', cls_name)
                 return
 
-            self.log.info(f'{cls_name}: executing cmd no. {cnt}: {cmd}')
+            self.log.info(f'{cls_name}: executing cmd no, {cnt}: {cmd}')
 
             try:
-                if as_iter:
-                    # Consider yielding command per command
-                    r = (yield from self._executeSingle(cmd, as_iter=as_iter))
-                else:
-                    r = self._executeSingle(cmd, as_iter=as_iter)
+
+                # Consider yielding message per message
+                # That would give this part a better idea what is happening.
+                # e.g. timeout reset after each command received.
+                # Thus timeout after the last command.
+                r = (yield from self._executeSingle(cmd))
+
             except Exception as exc:
                 stream = sys.stderr
                 stream.flush()
@@ -296,19 +322,16 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
             # self.command_queue.task_done()
             self.result_queue.put(r)
 
-    def _executeSingle(self, cmd, as_iter=False):
+    def _executeSingle(self, cmd):
         '''
         Todo:
             Consider if a 'static' or instance message is yielded
             as soon as execution stops.
 
             Why:
-                e.g. bluesky deferred pause request. Inform bluesky
-                     that user should interact...
+                e.g. bluesky deferred pause request. Then timeouts should be
+                delayed until resume is issued. Halt, abort, should be handled.
         '''
-
-        if not as_iter:
-            raise NotImplementedError('Direct call is not tested yet')
 
         cls_name = self.__class__.__name__
         self.log.info(f'{cls_name}: waiting for commands to execute')
@@ -322,72 +345,57 @@ class _DelegateToIterator(_BaseClass_Bridge_Delegator):
             '''A much ado about intercepting in between all these messages
 
             Todo:
-                This code does not work together with bluesky
+                This code does not work together with bluesky??
             '''
             while True:
                 try:
-                    c = next(a_iter)
+                    val = next(a_iter)
                 except StopIteration as si:
                     return si.value
 
                 if self.state.is_stopping:
                     txt = (
                         f'{cls_name} Request for stopping command execution.'
-                        f' Stopping before executing cmd {c}'
+                        f' Stopping before executing cmd {val}'
                     )
                     self.log.info(txt)
                     raise ExecutionStopRequest(txt)
-                elif self.state.is_stopped:
-                    txt = fmt.format(cls_name, self.state.state, c)
-                    self.log.warning(txt)
-                    raise ExecutionStopRequest(txt)
-                elif self.state.is_failed:
-                    txt = fmt.format(cls_name, self.state.state, c)
+
+                elif self.state.is_stopped or self.state.is_failed:
+                    txt = fmt.format(cls_name, self.state.state, val)
                     self.log.warning(txt)
                     raise ExecutionStopRequest(txt)
 
-                yield c
+                else:
+                    txt = 'Why am I in state {}'.format(self.state.state)
+                    raise AssertionError(txt)
 
-        if as_iter:
-            r = (yield from cmd())
-            # r = (yield from run_iter(cmd()) )
-        else:
-            raise NotImplementedError('Not tested yet')
-            r = cmd()
+                yield val
+
+        r = (yield from cmd())
         return r
 
 
-class CallbackIteratorBridge(_BridgeToDelegator, _DelegateToIterator,
-                             _BaseClass_Bridge_Delegator):
+class CallbackIteratorBridge(
+        _BaseClass_Bridge,
+        _CallbackToBrigeMixin,
+        _BridgeToIteratorMixin,
+        CallbackIteratorBridgeInterface,
+):
     '''Delegate submitted plans to the iterator consumer
 
-    Follows delegator pattern.
-
-    Args:
-        log :           a logger.Logger instance. Typically the
-                        logger of the RunEngine
-        command_queue : a queue of length 1
-        result_queue  : a queue of length 1
-
-    User is expected to submit command using :meth:`submit`.
-    These command will then appear to the iterator consumer.
-    This executor can be used by functions that expect a callback.
-    The callback is then responsible to submit its commands using
-    :meth:`submit`. These callbacks are then handed out from the
-    __iter__ method.
-
-    This approach allows:
-        * passing a plan to the run engine
-        * execute the call back in a separate coroutine thread
-          or callback
-
-    Warning:
-        The callback and the run engine must be executed in
-        different runnable entities (e.g. different threads).
-        The queues must match the properties as described in
-        the arguments.
-
-    If you are using it in a threaded environment function
-    :func:`bcib.threaded_bridge.setup_threaded_callback_iterator_bridge`
-    can be used to setup such a bridge.
+    see :class:`CallbackIteratorBridgeInterface` for details
     '''
+    ## # -------------------------------------------------------------------------
+    ## # Context manager methods
+    ## def __enter__(self):
+    ##    self.reset()
+    ##
+    ## def __exit__(self, exc_type, exc_value, exc_tb):
+    ##     if self.exc_type is None:
+    ##         fail_mode = False
+    ##     else:
+    ##         fail_mode = True
+    ##         self.state.set_failed()
+    ##
+    ##     self.stopDelegation(fail_mode)
