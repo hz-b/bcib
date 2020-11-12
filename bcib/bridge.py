@@ -102,6 +102,7 @@ class EndOfEvaluation:
 
 end_of_evaluation = EndOfEvaluation()
 
+
 # CallbackIteratorBridgeInterface
 class _BaseClass_Bridge:
     '''Base class
@@ -345,7 +346,7 @@ class _BridgeToIteratorMixin:
             '''A much ado about intercepting in between all these messages
 
             Todo:
-                This code does not work together with bluesky??
+                Context manager
             '''
             while True:
                 try:
